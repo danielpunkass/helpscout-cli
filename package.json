@@ -8,7 +8,7 @@
     "helpscout": "dist/cli.js"
   },
   "scripts": {
-    "dev": "bun run src/cli.ts",
+    "dev": "bun --preload ./scripts/dev-defines.ts src/cli.ts",
     "build": "bun run tsup",
     "test": "bun run vitest",
     "lint": "bun run oxlint src",

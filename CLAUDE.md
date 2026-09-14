@@ -16,7 +16,7 @@ bun run link         # Build and link globally (makes `helpscout` available syst
 bun run start        # Run built CLI from dist/
 
 # Testing the CLI locally
-bun run src/cli.ts <command>     # Run directly without building
+bun run dev <command>            # Run directly without building (preloads scripts/dev-defines.ts for __VERSION__/__HOMEPAGE__)
 bun dist/cli.js <command>        # Run after building
 ```
 
