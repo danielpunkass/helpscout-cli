@@ -368,6 +368,37 @@ describe('HelpScoutClient', () => {
     await expect(client.downloadAttachment(123, 456)).rejects.toMatchObject({ statusCode: 404 });
   });
 
+  it('hints at the conversation ID when a 404 id is really a ticket number', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          _embedded: { conversations: [{ id: 3242245802, number: 26398 }] },
+          page: { size: 25, totalElements: 1, totalPages: 1, number: 1 },
+        })
+      );
+
+    await expect(client.getConversation(26398)).rejects.toMatchObject({
+      statusCode: 404,
+      hint: '26398 is a ticket number, not a conversation ID. Use "#26398" or conversation ID 3242245802.',
+    });
+    expect(String(fetchMock.mock.calls[1][0])).toContain('query=number%3A26398');
+  });
+
+  it('omits the hint when no conversation has that ticket number', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          _embedded: { conversations: [] },
+          page: { size: 25, totalElements: 0, totalPages: 0, number: 1 },
+        })
+      );
+
+    const error = await client.getConversation(99999).catch((e) => e);
+    expect(error).toMatchObject({ statusCode: 404, hint: undefined });
+  });
+
   // --- Mailbox vs Docs auth boundary (characterization) ---
   // These two pin the single highest-risk behavior of the two-API client: a
   // Mailbox 401 must refresh and retry; a Docs 401 must NOT touch the shared

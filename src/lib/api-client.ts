@@ -577,10 +577,44 @@ export class HelpScoutClient {
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
-      throw new HelpScoutApiError('API request failed', error, response.status);
+      const hint =
+        response.status === 404 && api === 'mailbox'
+          ? await this.conversationNumberHint(path)
+          : undefined;
+      throw new HelpScoutApiError('API request failed', error, response.status, hint);
     }
 
     return response;
+  }
+
+  /**
+   * A 404 on /conversations/{n} usually means the caller passed the visible
+   * ticket number instead of the internal id. If a conversation with that
+   * number exists, return a hint naming both usable forms.
+   */
+  private async conversationNumberHint(path: string): Promise<string | undefined> {
+    const match = /^\/conversations\/(\d+)(?:\/|$)/.exec(path);
+    if (!match) {
+      return undefined;
+    }
+    const number = parseInt(match[1], 10);
+    try {
+      const conversation = await this.findConversationByNumber(number);
+      if (!conversation || conversation.id === number) {
+        return undefined;
+      }
+      return `${number} is a ticket number, not a conversation ID. Use "#${number}" or conversation ID ${conversation.id}.`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async findConversationByNumber(number: number) {
+    const { conversations } = await this.listConversations({
+      query: `number:${number}`,
+      status: 'all',
+    });
+    return conversations.find((c) => c.number === number);
   }
 
   private async request<T>(
@@ -756,11 +790,7 @@ export class HelpScoutClient {
       if (isNaN(number) || number <= 0) {
         throw new HelpScoutCliError(`Invalid conversation number: "${ref}"`, 400);
       }
-      const { conversations } = await this.listConversations({
-        query: `number:${number}`,
-        status: 'all',
-      });
-      const match = conversations.find((c) => c.number === number);
+      const match = await this.findConversationByNumber(number);
       if (!match) {
         throw new HelpScoutCliError(`No conversation found with number #${number}`, 404);
       }

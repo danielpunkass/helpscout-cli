@@ -72,7 +72,8 @@ All API calls go through `HelpScoutClient.withErrorHandling()` which catches err
   "error": {
     "name": "error_name",
     "detail": "Error detail",
-    "statusCode": 400
+    "statusCode": 400,
+    "hint": "Optional suggested fix (e.g. rate limits, ticket number passed as an ID)"
   }
 }
 ```
