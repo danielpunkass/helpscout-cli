@@ -58,8 +58,27 @@ merge if/when upstream adopts a fix (see Aftercare).
 
 | Issue | Bug | Fork-side state |
 |-------|-----|-----------------|
-| [#48](https://github.com/stephendolan/helpscout-cli/issues/48) | `draft-reply` 400 — reply omits required `customer` | Live in fork too; local fix was reverted, NOT carried — CLI draft path still 400s |
+| [#48](https://github.com/stephendolan/helpscout-cli/issues/48) | `draft-reply` 400 — reply omits required `customer` | **FIXED UPSTREAM + MERGED 2026-08-05.** Filed 6/14, closed 7/24 by `4a00579` (author: Simo Elalj, an outside contributor — not the maintainer), shipped in `v2.17.1`. Adopted verbatim in `b6eca0a`, with upstream's regression test hand-carried out of the merge commit `6d0f577` (it ships there, not in `4a00579`). Fork duplicate dropped: none existed to drop. |
 | [#56](https://github.com/stephendolan/helpscout-cli/issues/56) | MCP output validation: `customFields[].type` required but list/search embed omits it | Fix carried on `main` (`20d18fe`, 2026-06-23): `type`→optional + `text` declared + regression test in `src/mcp/server.test.ts`. Distinct failure mode from upstream's #50 passthrough sweep (missing required field, not an extra unknown one). Drop on upstream adoption |
+
+### #48 history — correcting the "local fix was reverted" note
+
+That framing was wrong and is worth getting straight, because it mis-describes how the fork
+loses fixes. Nothing was reverted by us. What happened:
+
+- `c8f2765` ("Fix create_reply: include required customer ID", Chris Barajas, 2026-01-19)
+  fixed this root cause **six months before upstream did**, across three files — and it
+  survives on `main` today (`src/lib/api-client.ts:866`, `customer: { id: data.customer }`).
+- Upstream's `e8507cd` (`chore(release): 2.10.0`, 2026-04-14) renamed the CLI `reply` command
+  to `draft-reply` and dropped live-reply. Merging that **wiped the CLI half of our fix** —
+  not by conflict, but because the code it patched no longer existed.
+- Net effect: MCP `create_reply` kept working (it resolves the customer at the caller,
+  `src/mcp/server.ts`), while both *draft* paths silently 400'd for ~4 months.
+
+**Failure mode to watch for: an upstream rename or refactor can delete a fork patch without
+ever producing a conflict.** A green merge is not evidence our fixes survived it. When
+upstream restructures a command we've patched, re-check the patch by behavior, not by
+whether git complained.
 
 ## Aftercare
 

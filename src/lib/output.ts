@@ -27,6 +27,42 @@ export function htmlToPlainText(html: string): string {
     .trim();
 }
 
+/** Compare message bodies after Help Scout's HTML and whitespace normalization. */
+export function normalizeBodyText(body: string): string {
+  return htmlToPlainText(body).replace(/\s+/g, ' ').trim();
+}
+
+/** Whitespace-only normalization, with no HTML interpretation. */
+export function collapseWhitespace(body: string): string {
+  return body.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Does a stored Help Scout body represent the text we asked it to store?
+ *
+ * `normalizeBodyText` alone is not sufficient, because it runs the *caller's*
+ * text through an HTML parser too. Angle-bracketed plain text — `<Command-Q>`,
+ * `<your license key>`, the kind of placeholder that shows up in real support
+ * replies — is parsed as a tag and DELETED from the expected side, while the
+ * stored side (which Help Scout escaped to `&lt;…&gt;`) decodes back to the
+ * literal text. The two then disagree about content that round-tripped
+ * perfectly:
+ *
+ *   normalizeBodyText('Press <Command-Q> to quit')       -> 'Press to quit'
+ *   normalizeBodyText('Press &lt;Command-Q&gt; to quit') -> 'Press <Command-Q> to quit'
+ *
+ * On a draft write that mismatch throws 502 for a draft that WAS created, which
+ * is the duplicate-reply trap the draft lifecycle exists to prevent. So we also
+ * accept the case where the stored body, rendered to plain text, equals the
+ * caller's text with only whitespace collapsed.
+ */
+export function storedBodyMatches(storedBody: string, expectedText: string): boolean {
+  return (
+    normalizeBodyText(storedBody) === normalizeBodyText(expectedText) ||
+    normalizeBodyText(storedBody) === collapseWhitespace(expectedText)
+  );
+}
+
 function convertBodiesToPlainText(data: unknown): unknown {
   if (Array.isArray(data)) {
     return data.map(convertBodiesToPlainText);

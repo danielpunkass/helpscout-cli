@@ -1,8 +1,20 @@
 import { auth } from './auth.js';
 import { HelpScoutCliError, HelpScoutApiError } from './errors.js';
+import { storedBodyMatches } from './output.js';
+import {
+  CONVERSATION_LIST_PARAMS,
+  CUSTOMER_LIST_PARAMS,
+  MAILBOX_LIST_PARAMS,
+  TAG_LIST_PARAMS,
+  USER_LIST_PARAMS,
+  WORKFLOW_LIST_PARAMS,
+  buildWireParams,
+  toQueryParams,
+} from './query-params.js';
 import type {
   Conversation,
   ConversationStatus,
+  AttachmentDownload,
   Customer,
   CustomerAddress,
   CustomerAddressInput,
@@ -10,6 +22,8 @@ import type {
   CustomerPropertyDefinition,
   CustomerPropertyOperation,
   DraftConversationStatus,
+  DraftReply,
+  DraftReplyWriteResult,
   Webhook,
   WebhookInput,
   MailboxFolder,
@@ -312,6 +326,64 @@ interface AuthProvider {
   getDocsApiKey(): Promise<string | null>;
 }
 
+async function toAttachmentDownload(response: Response): Promise<AttachmentDownload> {
+  const contentLength = response.headers.get('Content-Length');
+
+  return {
+    data: new Uint8Array(await response.arrayBuffer()),
+    contentType: response.headers.get('Content-Type') ?? undefined,
+    contentLength: contentLength ? parseInt(contentLength, 10) : undefined,
+    contentDisposition: response.headers.get('Content-Disposition') ?? undefined,
+  };
+}
+
+const DRAFT_PREVIEW_LENGTH = 300;
+
+// `state` is the thread-lifecycle field ('draft' vs 'published'); `status` is NOT.
+// Upstream's #65 additionally required status === 'active', but Help Scout stamps a
+// thread's `status` with the CONVERSATION's status at the moment the thread is created,
+// so it is neither a draft-lifecycle field nor stable within one conversation. Verified
+// live 2026-08-19: conversation 3374803075 carries `type: message` threads at BOTH
+// status 'closed' and status 'active', and every agent reply on 3194119012 is 'closed'
+// (10/10 sampled). The fork's own threadSchema comment says as much — status is optional
+// and absent on some thread types.
+//
+// Keeping upstream's clause would have broken the fork's normal workflow: a draft written
+// on a pending or closed conversation gets that status, so listDraftReplies would hide it
+// and verifyDraftReply would throw 502 "post-write verification failed" for a draft that
+// WAS created — inviting exactly the duplicate replies #64 exists to prevent.
+function isDraftReply(
+  thread: Thread
+): thread is Thread & { type: 'message'; state: 'draft'; body: string } {
+  return (
+    thread.type === 'message' && thread.state === 'draft' && typeof thread.body === 'string'
+  );
+}
+
+function toDraftReply(
+  conversationId: number,
+  thread: Thread & { type: 'message'; state: 'draft'; body: string }
+): DraftReply {
+  const preview =
+    thread.body.length > DRAFT_PREVIEW_LENGTH
+      ? `${thread.body.slice(0, DRAFT_PREVIEW_LENGTH).trim()}...`
+      : thread.body;
+  return {
+    threadId: thread.id,
+    conversationId,
+    type: thread.type,
+    state: thread.state,
+    status: thread.status,
+    body: thread.body,
+    preview,
+    createdAt: thread.createdAt,
+    createdBy: thread.createdBy,
+    to: thread.to,
+    cc: thread.cc,
+    bcc: thread.bcc,
+  };
+}
+
 export class HelpScoutClient {
   private accessToken: string | null = null;
 
@@ -505,10 +577,44 @@ export class HelpScoutClient {
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
-      throw new HelpScoutApiError('API request failed', error, response.status);
+      const hint =
+        response.status === 404 && api === 'mailbox'
+          ? await this.conversationNumberHint(path)
+          : undefined;
+      throw new HelpScoutApiError('API request failed', error, response.status, hint);
     }
 
     return response;
+  }
+
+  /**
+   * A 404 on /conversations/{n} usually means the caller passed the visible
+   * ticket number instead of the internal id. If a conversation with that
+   * number exists, return a hint naming both usable forms.
+   */
+  private async conversationNumberHint(path: string): Promise<string | undefined> {
+    const match = /^\/conversations\/(\d+)(?:\/|$)/.exec(path);
+    if (!match) {
+      return undefined;
+    }
+    const number = parseInt(match[1], 10);
+    try {
+      const conversation = await this.findConversationByNumber(number);
+      if (!conversation || conversation.id === number) {
+        return undefined;
+      }
+      return `${number} is a ticket number, not a conversation ID. Use "#${number}" or conversation ID ${conversation.id}.`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async findConversationByNumber(number: number) {
+    const { conversations } = await this.listConversations({
+      query: `number:${number}`,
+      status: 'all',
+    });
+    return conversations.find((c) => c.number === number);
   }
 
   private async request<T>(
@@ -605,10 +711,14 @@ export class HelpScoutClient {
       query?: string;
     } = {}
   ) {
+    // Translate to HS's exact query keys before sending. This remaps the assignee
+    // filter to its snake_case wire key `assigned_to` (HS silently ignores the
+    // camelCase `assignedTo`, so without this the filter is a no-op that returns the
+    // whole folder) and gates every key through the endpoint's known-param spec.
     const response = await this.request<PaginatedResponse<{ conversations: Conversation[] }>>(
       'GET',
       '/conversations',
-      { params }
+      { params: buildWireParams(params, CONVERSATION_LIST_PARAMS) }
     );
     return {
       conversations: response._embedded?.conversations || [],
@@ -680,11 +790,7 @@ export class HelpScoutClient {
       if (isNaN(number) || number <= 0) {
         throw new HelpScoutCliError(`Invalid conversation number: "${ref}"`, 400);
       }
-      const { conversations } = await this.listConversations({
-        query: `number:${number}`,
-        status: 'all',
-      });
-      const match = conversations.find((c) => c.number === number);
+      const match = await this.findConversationByNumber(number);
       if (!match) {
         throw new HelpScoutCliError(`No conversation found with number #${number}`, 404);
       }
@@ -813,10 +919,103 @@ export class HelpScoutClient {
       text: string;
       user?: number;
     }
-  ) {
-    await this.request<void>('POST', `/conversations/${conversationId}/reply`, {
-      body: { ...data, draft: true },
+  ): Promise<DraftReplyWriteResult> {
+    const conversation = await this.getConversation(conversationId);
+    const customerId = conversation?.primaryCustomer?.id;
+    if (!customerId) {
+      throw new Error(
+        `Cannot create draft reply: conversation ${conversationId} has no primary customer`
+      );
+    }
+    const response = await this.rawRequest('POST', `/conversations/${conversationId}/reply`, {
+      body: { ...data, customer: { id: customerId }, draft: true },
     });
+    const resourceId = response.headers.get('Resource-ID');
+    const threadId = resourceId && /^\d+$/.test(resourceId) ? Number(resourceId) : NaN;
+    if (!Number.isSafeInteger(threadId) || threadId <= 0) {
+      throw new HelpScoutCliError(
+        'Draft reply created but Help Scout did not return a valid Resource-ID thread header',
+        502
+      );
+    }
+    return this.verifyDraftReply(conversationId, threadId, data.text, 'created');
+  }
+
+  async listDraftReplies(conversationId: number): Promise<DraftReply[]> {
+    const threads = await this.getConversationThreads(conversationId);
+    return threads.filter(isDraftReply).map((thread) => toDraftReply(conversationId, thread));
+  }
+
+  async updateDraftReply(
+    conversationId: number,
+    threadId: number,
+    text: string
+  ): Promise<DraftReplyWriteResult> {
+    const threads = await this.getConversationThreads(conversationId);
+    const thread = threads.find((candidate) => candidate.id === threadId);
+    if (!thread) {
+      throw new HelpScoutCliError(
+        `Cannot update draft reply: thread ${threadId} does not exist in conversation ${conversationId}`,
+        404
+      );
+    }
+    if (!isDraftReply(thread)) {
+      throw new HelpScoutCliError(
+        `Refusing to update thread ${threadId}: expected an active draft reply (type message, state draft, status active), found type ${thread.type}, state ${thread.state ?? 'unknown'}, status ${thread.status ?? 'unknown'}`,
+        409
+      );
+    }
+
+    await this.request<void>('PATCH', `/conversations/${conversationId}/threads/${threadId}`, {
+      body: { op: 'replace', path: '/text', value: text },
+    });
+    return this.verifyDraftReply(conversationId, threadId, text, 'updated');
+  }
+
+  async upsertDraftReply(
+    conversationId: number,
+    data: { text: string; user?: number; threadId?: number }
+  ): Promise<DraftReplyWriteResult> {
+    if (data.threadId !== undefined) {
+      return this.updateDraftReply(conversationId, data.threadId, data.text);
+    }
+
+    const drafts = await this.listDraftReplies(conversationId);
+    if (drafts.length === 0) {
+      return this.createDraftReply(conversationId, { text: data.text, user: data.user });
+    }
+    if (drafts.length === 1) {
+      return this.updateDraftReply(conversationId, drafts[0].threadId, data.text);
+    }
+
+    const ids = drafts.map((draft) => draft.threadId).join(', ');
+    throw new HelpScoutCliError(
+      `Refusing to choose among ${drafts.length} active draft replies (${ids}). Specify the intended thread ID explicitly.`,
+      409
+    );
+  }
+
+  private async verifyDraftReply(
+    conversationId: number,
+    threadId: number,
+    expectedText: string,
+    action: DraftReplyWriteResult['action']
+  ): Promise<DraftReplyWriteResult> {
+    const threads = await this.getConversationThreads(conversationId);
+    const thread = threads.find((candidate) => candidate.id === threadId);
+    if (!thread || !isDraftReply(thread) || !storedBodyMatches(thread.body, expectedText)) {
+      throw new HelpScoutCliError(
+        `Draft reply ${action} but post-write verification failed for thread ${threadId}: expected an unsent draft with the requested text`,
+        502
+      );
+    }
+    return {
+      conversationId,
+      threadId,
+      action,
+      verified: true,
+      draft: toDraftReply(conversationId, thread),
+    };
   }
 
   async createReply(
@@ -926,7 +1125,7 @@ export class HelpScoutClient {
     const response = await this.request<PaginatedResponse<{ customers: Customer[] }>>(
       'GET',
       '/customers',
-      { params }
+      { params: buildWireParams(params, CUSTOMER_LIST_PARAMS) }
     );
     return {
       customers: response._embedded?.customers || [],
@@ -1361,7 +1560,7 @@ export class HelpScoutClient {
   // Tags
   async listTags(page?: number) {
     const response = await this.request<PaginatedResponse<{ tags: Tag[] }>>('GET', '/tags', {
-      params: page ? { page } : undefined,
+      params: buildWireParams({ page }, TAG_LIST_PARAMS),
     });
     return {
       tags: response._embedded?.tags || [],
@@ -1378,7 +1577,7 @@ export class HelpScoutClient {
     const response = await this.request<PaginatedResponse<{ workflows: Workflow[] }>>(
       'GET',
       '/workflows',
-      { params: { mailboxId: params.mailbox, type: params.type, page: params.page } }
+      { params: buildWireParams(params, WORKFLOW_LIST_PARAMS) }
     );
     return {
       workflows: response._embedded?.workflows || [],
@@ -1403,7 +1602,7 @@ export class HelpScoutClient {
     const response = await this.request<PaginatedResponse<{ mailboxes: Mailbox[] }>>(
       'GET',
       '/mailboxes',
-      { params: page ? { page } : undefined }
+      { params: buildWireParams({ page }, MAILBOX_LIST_PARAMS) }
     );
     return {
       mailboxes: response._embedded?.mailboxes || [],
@@ -1430,7 +1629,7 @@ export class HelpScoutClient {
           mention?: string;
         }>;
       }>
-    >('GET', '/users', { params: { email: params.email, mailbox: params.mailbox, page: params.page } });
+    >('GET', '/users', { params: buildWireParams(params, USER_LIST_PARAMS) });
     return {
       users: response._embedded?.users || [],
       page: response.page,
@@ -1636,7 +1835,10 @@ export class HelpScoutClient {
   // inflation; added to the HS API 2026-01-29). Documented as a direct 200, but
   // if HS ever 30x-redirects to storage we must NOT forward the Authorization
   // header to the storage host — hence manual redirect + a bare re-fetch.
-  async downloadAttachment(conversationId: number, attachmentId: number): Promise<Buffer> {
+  async downloadAttachment(
+    conversationId: number,
+    attachmentId: number
+  ): Promise<AttachmentDownload> {
     const response = await this.rawRequest(
       'GET',
       `/conversations/${conversationId}/attachments/${attachmentId}/file`,
@@ -1658,10 +1860,11 @@ export class HelpScoutClient {
           redirected.status
         );
       }
-      return Buffer.from(await redirected.arrayBuffer());
+      // Metadata comes off the storage response — the 30x itself carries none.
+      return toAttachmentDownload(redirected);
     }
 
-    return Buffer.from(await response.arrayBuffer());
+    return toAttachmentDownload(response);
   }
 
   // Upload attachment to a thread
@@ -1692,44 +1895,44 @@ export class HelpScoutClient {
   // Reports (Plus/Pro plans only)
   async getCompanyReport(params: ReportParams): Promise<CompanyReport> {
     return this.request<CompanyReport>('GET', '/reports/company', {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 
   async getConversationsReport(params: ReportParams): Promise<ConversationsReport> {
     return this.request<ConversationsReport>('GET', '/reports/conversations', {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 
   async getProductivityReport(params: ProductivityReportParams): Promise<ProductivityReport> {
     return this.request<ProductivityReport>('GET', '/reports/productivity', {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 
   async getFirstResponseTimeReport(params: TimeSeriesReportParams): Promise<FirstResponseTimeReport> {
     return this.request<FirstResponseTimeReport>('GET', '/reports/productivity/first-response-time', {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 
   async getHappinessReport(params: ReportParams): Promise<HappinessReport> {
     return this.request<HappinessReport>('GET', '/reports/happiness', {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 
   async getHappinessRatings(params: HappinessRatingsParams): Promise<HappinessRatingsReport> {
     return this.request<HappinessRatingsReport>('GET', '/reports/happiness/ratings', {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 
   // Helper for the expanded GET report endpoints (all share the params-cast shape).
   private getReport<T>(path: string, params: object): Promise<T> {
     return this.request<T>('GET', path, {
-      params: params as unknown as Record<string, string | number | boolean | undefined>,
+      params: toQueryParams(params),
     });
   }
 

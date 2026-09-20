@@ -149,6 +149,48 @@ export interface AttachmentData {
   data: string; // Base64-encoded file content
 }
 
+export interface DraftReply {
+  threadId: number;
+  conversationId: number;
+  type: 'message';
+  state: 'draft';
+  // The conversation's status when the draft was written, not a draft-lifecycle value —
+  // and absent on some thread types. See isDraftReply in api-client.ts.
+  status?: string;
+  body: string;
+  preview: string;
+  createdAt: string;
+  createdBy?: Thread['createdBy'];
+  to?: string[];
+  cc?: string[];
+  bcc?: string[];
+}
+
+export interface DraftReplyWriteResult {
+  conversationId: number;
+  threadId: number;
+  action: 'created' | 'updated';
+  verified: true;
+  draft: DraftReply;
+}
+
+export interface AttachmentDownload {
+  data: Uint8Array;
+  contentType?: string;
+  contentLength?: number;
+  contentDisposition?: string;
+}
+
+export interface AttachmentDownloadResult {
+  message: 'Attachment downloaded';
+  conversationId: number;
+  attachmentId: number;
+  filename: string;
+  path: string;
+  bytes: number;
+  contentType?: string;
+}
+
 export interface Customer {
   id: number;
   firstName?: string;

@@ -1,6 +1,24 @@
 # Streaming Attachment Download — Implementation Plan
 
-**Drafted:** 2026-06-12 · **Status:** SPEC — not started
+**Drafted:** 2026-06-12 · **Status: DONE** — shipped 2026-06-15 in `11decce`
+("feat(attachments): stream attachment downloads with base64 fallback"), three days after this
+spec was drafted. Write layer hardened 2026-08-05 in `b6eca0a` (see below). *This doc is kept
+as a record; do not re-implement from it.*
+
+> **Correction (2026-08-05): "streaming" is a misnomer here — nothing streams, on either side.**
+> Both our `downloadAttachment` and upstream's read the whole body with a single
+> `response.arrayBuffer()` (`src/lib/api-client.ts:328`) and hold it in memory before writing.
+> The win this doc actually delivered was **escaping the base64 `/data` endpoint's ~33%
+> inflation**, not reducing peak memory — a multi-MB debug log is still fully buffered.
+> True streaming (`Bun.write(path, response)`, or piping the body to a file handle) remains
+> unimplemented, and is now slightly more involved because the write path goes through an
+> atomic temp-file + `link()` step. Worth doing only if a hang report large enough to matter
+> actually shows up; the inflation fix was the part that was hurting.
+>
+> Also landed 2026-08-05 from upstream: `--force`, an EEXIST guard (the old path used a bare
+> `writeFileSync` that silently clobbered), recursive `mkdir`, and directory-output support.
+> Filenames still come from `listConversationAttachments`, **not** Content-Disposition —
+> upstream parses the header only because it has no such endpoint.
 **Size:** Small (one client method, one command path, tests)
 **Motivation:** The daily debug-log workflow pulls multi-MB attachments through the base64
 `/data` endpoint (~33% inflation + full buffering). Today's HS #177569 dive moved ~4 MB of

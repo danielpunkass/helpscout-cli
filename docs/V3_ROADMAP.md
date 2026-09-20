@@ -69,12 +69,24 @@ creation (customer/chat/phone) + original source + scheduling, user create/delet
 the full reports family (26 endpoints). MCP server now serves **132 tools** (was 62). Only
 parked: Organizations + user status (no RA use case). See `API_COVERAGE.md` for the matrix.
 
-**Still open (need a Claude Code session restart / live auth):** post-restart MCP smokes
-(`create_note`, live `note --status closed`, `search_conversations` caps), live verification of
-the new tools (system_user on a real bot conversation; streaming download on a large attachment;
-reports against the Plus account); the **Dev CLAUDE.md MCP-tool table is now very stale** (lists
-36; reality is 132) — left for Chris (global-instructions file). Deferred: `outputSchema`/
-structured content on the migrated + new MCP tools (handlers return `jsonResponse`).
+**Still open — refreshed 2026-08-19** (the restart gate is long since satisfied; these are real
+remaining work, not blocked-on-restart):
+
+- **Live mutating smoke still owed:** a real `note --status closed` folded into a natural close.
+  `create_note` and `search_conversations` caps have since been exercised in daily use.
+  *(Adopted here 2026-08-19 from the outboard inbox, which was cleared; this is now its only home.)*
+- **`outputSchema` / structured-content migration — the headline enhancement.** Measured off a
+  live `tools/list` on 2026-08-19: **172 tools served, 24 declare an `outputSchema`, 148 do not**
+  and still return unstructured `jsonResponse`. (The old "94/109" figure predates the Docs and
+  expanded-reports families.) Two riders learned the hard way this month: every added
+  `outputSchema` is load-bearing at *registration* time — a wrong dialect unregisters the tool
+  host-side (see UPSTREAM_SYNC hazard 3) — and a `z.literal` in one of these will fail the whole
+  call when real data disagrees, which has now happened twice (`subject`, draft `status`). Prefer
+  optional + permissive over literal unless the value is genuinely structural.
+- Live verification of the newer tools: `system_user` on a real bot conversation; streaming
+  download on a large attachment; reports against the Plus account.
+- ⚠️ **The dev `CLAUDE.md` MCP-tool count is stale again** — it says 132 (as of 2026-06-15);
+  reality is **172 served**. Global-instructions file, so left for Chris.
 
 ### Spec index (size + status)
 

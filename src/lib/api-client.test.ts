@@ -10,7 +10,23 @@ function thread(id: number, type = 'customer') {
   };
 }
 
-function paginatedThreads(threads: Array<Record<string, unknown>>, page: number, totalPages: number) {
+function draftThread(id: number, body = `<p>Draft ${id}</p>`) {
+  return {
+    id,
+    type: 'message',
+    status: 'active',
+    state: 'draft',
+    body,
+    createdAt: `2026-06-0${id}T00:00:00Z`,
+    createdBy: { id: 42, type: 'user', first: 'Ada', last: 'Lovelace' },
+  };
+}
+
+function paginatedThreads(
+  threads: Array<Record<string, unknown>>,
+  page: number,
+  totalPages: number
+) {
   return Response.json({
     _embedded: { threads },
     page: {
@@ -19,6 +35,29 @@ function paginatedThreads(threads: Array<Record<string, unknown>>, page: number,
       totalPages,
       number: page,
     },
+  });
+}
+
+function paginatedConversations(
+  conversations: Array<Record<string, unknown>>,
+  page: number,
+  totalPages: number
+) {
+  return Response.json({
+    _embedded: { conversations },
+    page: {
+      size: conversations.length,
+      totalElements: totalPages,
+      totalPages,
+      number: page,
+    },
+  });
+}
+
+function paginatedResource(resource: string) {
+  return Response.json({
+    _embedded: { [resource]: [] },
+    page: { size: 0, totalElements: 0, totalPages: 0, number: 1 },
   });
 }
 
@@ -71,6 +110,167 @@ describe('HelpScoutClient', () => {
 
     expect(threads).toEqual([thread(1)]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  function emptyConversationsPage() {
+    return Response.json({
+      _embedded: { conversations: [] },
+      page: { size: 0, totalElements: 0, totalPages: 1, number: 1 },
+    });
+  }
+
+  it('sends the full conversation filter set with assignedTo remapped to assigned_to', async () => {
+    fetchMock.mockResolvedValueOnce(emptyConversationsPage());
+
+    await client.listConversations({
+      mailbox: '164710',
+      status: 'active',
+      tag: 'billing',
+      assignedTo: '320911',
+      sortField: 'createdAt',
+      sortOrder: 'desc',
+      page: 2,
+      embed: 'threads',
+      query: 'subject:refund',
+    });
+
+    // Locks the entire wire-key set: everything is verbatim except the assignee
+    // filter, which HS only honors as snake_case `assigned_to` (the camelCase key is
+    // silently ignored). Guards against a future rename quietly no-op'ing a filter.
+    const url = new URL(fetchMock.mock.calls[0][0] as string);
+    expect(Object.fromEntries(url.searchParams.entries())).toEqual({
+      mailbox: '164710',
+      status: 'active',
+      tag: 'billing',
+      assigned_to: '320911',
+      sortField: 'createdAt',
+      sortOrder: 'desc',
+      page: '2',
+      embed: 'threads',
+      query: 'subject:refund',
+    });
+    expect(url.search).not.toContain('assignedTo');
+  });
+
+  it('omits the assigned_to key entirely when no assignee filter is given', async () => {
+    fetchMock.mockResolvedValueOnce(emptyConversationsPage());
+
+    await client.listConversations({ status: 'active' });
+
+    // No stray `assigned_to=undefined` — an absent filter must send no key at all.
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).not.toContain('assigned');
+    expect(url).toContain('status=active');
+  });
+
+  it('carries the assignee filter through every listAllConversations page as assigned_to', async () => {
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        _embedded: { conversations: [{ id: 1 }] },
+        page: { size: 1, totalElements: 1, totalPages: 1, number: 1 },
+      })
+    );
+
+    // This is the path search_conversations uses — the all-pages fetch must filter by
+    // assignee server-side, not return the whole folder.
+    await client.listAllConversations({ status: 'active', assignedTo: '320911' });
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain('assigned_to=320911');
+    expect(url).toContain('page=1');
+  });
+
+  it('remaps the workflows mailbox filter to mailboxId on the wire', async () => {
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        _embedded: { workflows: [] },
+        page: { size: 0, totalElements: 0, totalPages: 1, number: 1 },
+      })
+    );
+
+    await client.listWorkflows({ mailbox: 164710, type: 'manual' });
+
+    // HS silently ignores ?mailbox= on /workflows; the filter only works as ?mailboxId=.
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain('mailboxId=164710');
+    expect(url).toContain('type=manual');
+    expect(url).not.toContain('mailbox=');
+  });
+
+  it('sends the users email filter under the email key', async () => {
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        _embedded: { users: [] },
+        page: { size: 0, totalElements: 0, totalPages: 1, number: 1 },
+      })
+    );
+
+    await client.listUsers({ email: 'paul@rogueamoeba.com' });
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain('email=paul%40rogueamoeba.com');
+  });
+
+  it('downloads attachment file bytes with response metadata', async () => {
+    const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0xff]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(bytes, {
+        headers: {
+          'Content-Type': 'application/pdf',
+          'Content-Length': String(bytes.length),
+          'Content-Disposition': 'attachment; filename="Invoice-BFFE9E51-0026.pdf"',
+        },
+      })
+    );
+
+    const attachment = await client.downloadAttachment(3361978051, 933302294);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.helpscout.net/v2/conversations/3361978051/attachments/933302294/file',
+      expect.objectContaining({ method: 'GET' })
+    );
+    expect(Array.from(attachment.data)).toEqual(Array.from(bytes));
+    expect(attachment.contentType).toBe('application/pdf');
+    expect(attachment.contentLength).toBe(bytes.length);
+    expect(attachment.contentDisposition).toBe('attachment; filename="Invoice-BFFE9E51-0026.pdf"');
+  });
+
+  it('refreshes auth and retries attachment downloads after 401 responses', async () => {
+    const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ error: 'unauthorized' }, { status: 401 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          access_token: 'fresh-token',
+          token_type: 'Bearer',
+          expires_in: 3600,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(bytes, { headers: { 'Content-Type': 'application/pdf' } })
+      );
+
+    const attachment = await client.downloadAttachment(3361978051, 933302294);
+
+    expect(Array.from(attachment.data)).toEqual(Array.from(bytes));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://api.helpscout.net/v2/conversations/3361978051/attachments/933302294/file'
+    );
+    expect(fetchMock.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+      })
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe('https://api.helpscout.net/v2/oauth2/token');
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      'https://api.helpscout.net/v2/conversations/3361978051/attachments/933302294/file'
+    );
+    expect(fetchMock.mock.calls[2][1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer fresh-token' }),
+      })
+    );
   });
 
   it('sends a status patch request', async () => {
@@ -126,9 +326,10 @@ describe('HelpScoutClient', () => {
       })
     );
 
-    const buf = await client.downloadAttachment(123, 456);
+    const result = await client.downloadAttachment(123, 456);
 
-    expect(buf).toEqual(Buffer.from([1, 2, 3, 4]));
+    expect(Array.from(result.data)).toEqual([1, 2, 3, 4]);
+    expect(result.contentType).toBe('image/png');
     expect(fetchMock.mock.calls[0][0]).toBe(
       'https://api.helpscout.net/v2/conversations/123/attachments/456/file'
     );
@@ -145,11 +346,18 @@ describe('HelpScoutClient', () => {
           headers: { Location: 'https://s3.example.com/signed/x.png?sig=abc' },
         })
       )
-      .mockResolvedValueOnce(new Response(new Uint8Array([9, 9]), { status: 200 }));
+      .mockResolvedValueOnce(
+        new Response(new Uint8Array([9, 9]), {
+          status: 200,
+          headers: { 'Content-Type': 'image/png' },
+        })
+      );
 
-    const buf = await client.downloadAttachment(123, 456);
+    const result = await client.downloadAttachment(123, 456);
 
-    expect(buf).toEqual(Buffer.from([9, 9]));
+    expect(Array.from(result.data)).toEqual([9, 9]);
+    // Metadata must come off the storage response — the 302 itself carries none.
+    expect(result.contentType).toBe('image/png');
     expect(fetchMock.mock.calls[1][0]).toBe('https://s3.example.com/signed/x.png?sig=abc');
     expect(fetchMock.mock.calls[1][1]).toBeUndefined();
   });
@@ -158,6 +366,37 @@ describe('HelpScoutClient', () => {
     fetchMock.mockResolvedValueOnce(Response.json({ error: 'not found' }, { status: 404 }));
 
     await expect(client.downloadAttachment(123, 456)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it('hints at the conversation ID when a 404 id is really a ticket number', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          _embedded: { conversations: [{ id: 3242245802, number: 26398 }] },
+          page: { size: 25, totalElements: 1, totalPages: 1, number: 1 },
+        })
+      );
+
+    await expect(client.getConversation(26398)).rejects.toMatchObject({
+      statusCode: 404,
+      hint: '26398 is a ticket number, not a conversation ID. Use "#26398" or conversation ID 3242245802.',
+    });
+    expect(String(fetchMock.mock.calls[1][0])).toContain('query=number%3A26398');
+  });
+
+  it('omits the hint when no conversation has that ticket number', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          _embedded: { conversations: [] },
+          page: { size: 25, totalElements: 0, totalPages: 0, number: 1 },
+        })
+      );
+
+    const error = await client.getConversation(99999).catch((e) => e);
+    expect(error).toMatchObject({ statusCode: 404, hint: undefined });
   });
 
   // --- Mailbox vs Docs auth boundary (characterization) ---
@@ -845,6 +1084,386 @@ describe('HelpScoutClient', () => {
 
     expect(customer.conversationCount).toBe(10);
     expect(fetchMock.mock.calls[0][0]).toBe('https://api.helpscout.net/v2/customers/42');
+  });
+
+  it('serializes the idiomatic assignee option to the Help Scout wire name', async () => {
+    fetchMock.mockResolvedValueOnce(paginatedConversations([], 1, 1));
+
+    await client.listConversations({ assignedTo: '728656' });
+
+    const url = new URL(fetchMock.mock.calls[0][0]);
+    expect(url.searchParams.get('assigned_to')).toBe('728656');
+    expect(url.searchParams.has('assignedTo')).toBe(false);
+  });
+
+  it('preserves status, sort, query, and page while mapping a team assignee ID', async () => {
+    fetchMock.mockResolvedValueOnce(paginatedConversations([], 3, 3));
+
+    await client.listConversations({
+      status: 'all',
+      assignedTo: '987654',
+      sortField: 'modifiedAt',
+      sortOrder: 'asc',
+      query: 'assigned:"Questionnaires"',
+      page: 3,
+    });
+
+    const url = new URL(fetchMock.mock.calls[0][0]);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      status: 'all',
+      assigned_to: '987654',
+      sortField: 'modifiedAt',
+      sortOrder: 'asc',
+      query: 'assigned:"Questionnaires"',
+      page: '3',
+    });
+  });
+
+  it('keeps the mapped assignee filter on every conversation page', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedConversations([{ id: 1 }], 1, 2))
+      .mockResolvedValueOnce(paginatedConversations([{ id: 2 }], 2, 2));
+
+    const conversations = await client.listAllConversations({
+      status: 'active',
+      assignedTo: '728656',
+      query: 'assigned:"Questionnaires"',
+    });
+
+    expect(conversations).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const [index, call] of fetchMock.mock.calls.entries()) {
+      const url = new URL(call[0]);
+      expect(url.searchParams.get('assigned_to')).toBe('728656');
+      expect(url.searchParams.has('assignedTo')).toBe(false);
+      expect(url.searchParams.get('page')).toBe(String(index + 1));
+      expect(url.searchParams.get('status')).toBe('active');
+      expect(url.searchParams.get('query')).toBe('assigned:"Questionnaires"');
+    }
+  });
+
+  it.each([
+    {
+      name: 'customers',
+      resource: 'customers',
+      path: '/customers',
+      invoke: () =>
+        client.listCustomers({
+          mailbox: '42',
+          firstName: 'Ada',
+          lastName: 'Lovelace',
+          sortField: 'modifiedAt',
+          sortOrder: 'asc',
+          page: 3,
+          query: 'email:ada@example.com',
+        }),
+      expected: {
+        mailbox: '42',
+        firstName: 'Ada',
+        lastName: 'Lovelace',
+        sortField: 'modifiedAt',
+        sortOrder: 'asc',
+        page: '3',
+        query: 'email:ada@example.com',
+      },
+    },
+    {
+      name: 'users',
+      resource: 'users',
+      path: '/users',
+      invoke: () => client.listUsers({ email: 'ada@example.com', mailbox: 42, page: 2 }),
+      expected: { email: 'ada@example.com', mailbox: '42', page: '2' },
+    },
+    {
+      name: 'tags',
+      resource: 'tags',
+      path: '/tags',
+      invoke: () => client.listTags(4),
+      expected: { page: '4' },
+    },
+    {
+      name: 'workflows',
+      resource: 'workflows',
+      path: '/workflows',
+      invoke: () => client.listWorkflows({ mailbox: 42, type: 'manual', page: 5 }),
+      expected: { mailboxId: '42', type: 'manual', page: '5' },
+    },
+    {
+      name: 'mailboxes',
+      resource: 'mailboxes',
+      path: '/mailboxes',
+      invoke: () => client.listMailboxes(6),
+      expected: { page: '6' },
+    },
+  ])('serializes the $name list endpoint with its exact wire contract', async (testCase) => {
+    fetchMock.mockResolvedValueOnce(paginatedResource(testCase.resource));
+
+    await testCase.invoke();
+
+    const url = new URL(fetchMock.mock.calls[0][0]);
+    expect(url.pathname).toBe(`/v2${testCase.path}`);
+    expect(Object.fromEntries(url.searchParams)).toEqual(testCase.expected);
+  });
+
+  it('creates a draft reply, parses Resource-ID, and verifies the live thread', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ primaryCustomer: { id: 729732479 } }))
+      .mockResolvedValueOnce(
+        new Response(null, { status: 201, headers: { 'Resource-ID': '10420000001' } })
+      )
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(10420000001, '<p>Draft reply</p>')], 1, 1)
+      );
+
+    const result = await client.createDraftReply(3401014297, {
+      text: '<p>Draft reply</p>',
+      user: 903917,
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://api.helpscout.net/v2/conversations/3401014297'
+    );
+    expect(fetchMock.mock.calls[1]).toEqual([
+      'https://api.helpscout.net/v2/conversations/3401014297/reply',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          text: '<p>Draft reply</p>',
+          user: 903917,
+          customer: { id: 729732479 },
+          draft: true,
+        }),
+      }),
+    ]);
+    expect(result).toEqual(
+      expect.objectContaining({
+        conversationId: 3401014297,
+        threadId: 10420000001,
+        action: 'created',
+        verified: true,
+      })
+    );
+  });
+
+  it('fails creation when Help Scout omits the Resource-ID header', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ primaryCustomer: { id: 729732479 } }))
+      .mockResolvedValueOnce(new Response(null, { status: 201 }));
+
+    await expect(client.createDraftReply(123, { text: 'Draft' })).rejects.toThrow(
+      'did not return a valid Resource-ID'
+    );
+  });
+
+  // Upstream's version of this test asserted a draft with status 'pending' was excluded.
+  // That encodes a wrong model of Help Scout: thread `status` is the CONVERSATION's status
+  // when the thread was written, so a draft on a pending/closed ticket is still a real,
+  // unsent draft. Verified live 2026-08-19 — see isDraftReply in api-client.ts.
+  it('lists unsent message drafts regardless of the conversation status stamped on them', async () => {
+    const longBody = 'x'.repeat(350);
+    fetchMock.mockResolvedValueOnce(
+      paginatedThreads(
+        [
+          draftThread(11, longBody),
+          { ...thread(12, 'message'), state: 'published' },
+          thread(13, 'note'),
+          { ...draftThread(14), status: 'pending' },
+        ],
+        1,
+        1
+      )
+    );
+
+    const drafts = await client.listDraftReplies(123);
+
+    // 11 (status active) AND 14 (status pending) — both are unsent drafts.
+    expect(drafts).toHaveLength(2);
+    expect(drafts.map((draft) => draft.threadId)).toEqual([11, 14]);
+    expect(drafts[0]).toEqual(
+      expect.objectContaining({
+        conversationId: 123,
+        threadId: 11,
+        state: 'draft',
+        body: longBody,
+        preview: `${'x'.repeat(300)}...`,
+        createdBy: expect.objectContaining({ id: 42 }),
+      })
+    );
+  });
+
+  it('updates a specific draft with JSON Patch and verifies the result', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'New')], 1, 1));
+
+    const result = await client.updateDraftReply(123, 11, 'New');
+
+    expect(fetchMock.mock.calls[1]).toEqual([
+      'https://api.helpscout.net/v2/conversations/123/threads/11',
+      expect.objectContaining({
+        method: 'PATCH',
+        body: JSON.stringify({ op: 'replace', path: '/text', value: 'New' }),
+      }),
+    ]);
+    expect(result).toEqual(
+      expect.objectContaining({ threadId: 11, action: 'updated', verified: true })
+    );
+  });
+
+  // A support reply containing an angle-bracketed placeholder — `<Command-Q>`,
+  // `<your license key>` — round-trips fine, but comparing both sides through the
+  // HTML parser deleted it from the EXPECTED side only, so verification failed and
+  // threw 502 for a draft that had been written. That is the duplicate-reply trap
+  // the draft lifecycle exists to prevent. See storedBodyMatches in output.ts.
+  it('verifies a draft whose plain-text angle brackets Help Scout escaped', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(11, 'Press &lt;Command-Q&gt; to quit')], 1, 1)
+      );
+
+    const result = await client.updateDraftReply(123, 11, 'Press <Command-Q> to quit');
+
+    expect(result).toEqual(
+      expect.objectContaining({ threadId: 11, action: 'updated', verified: true })
+    );
+  });
+
+  it('verifies plain-text newlines after Help Scout converts them to br tags', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(11, 'First line<br>Second line')], 1, 1)
+      );
+
+    await expect(client.updateDraftReply(123, 11, 'First line\nSecond line')).resolves.toEqual(
+      expect.objectContaining({ verified: true })
+    );
+  });
+
+  it('verifies semantically equivalent HTML input', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(11, '<p>Hello <strong>there</strong></p>')], 1, 1)
+      );
+
+    await expect(client.updateDraftReply(123, 11, 'Hello <strong>there</strong>')).resolves.toEqual(
+      expect.objectContaining({ verified: true })
+    );
+  });
+
+  it('normalizes whitespace and newlines during verification', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(11, '<p>Hello there</p><p>Next line</p>')], 1, 1)
+      );
+
+    await expect(
+      client.updateDraftReply(123, 11, '  Hello   there\r\n\nNext line  ')
+    ).resolves.toEqual(expect.objectContaining({ verified: true }));
+  });
+
+  it('refuses to update a published or non-draft thread', async () => {
+    fetchMock.mockResolvedValueOnce(
+      paginatedThreads([{ ...thread(11, 'message'), state: 'published' }], 1, 1)
+    );
+
+    await expect(client.updateDraftReply(123, 11, 'New')).rejects.toThrow(
+      'expected an active draft reply'
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an unknown thread ID before writing', async () => {
+    fetchMock.mockResolvedValueOnce(paginatedThreads([draftThread(11)], 1, 1));
+
+    await expect(client.updateDraftReply(123, 99, 'New')).rejects.toThrow('does not exist');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates on upsert when no active draft exists', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([], 1, 1))
+      .mockResolvedValueOnce(Response.json({ primaryCustomer: { id: 7 } }))
+      .mockResolvedValueOnce(new Response(null, { status: 201, headers: { 'Resource-ID': '22' } }))
+      .mockResolvedValueOnce(paginatedThreads([draftThread(22, 'Desired')], 1, 1));
+
+    const result = await client.upsertDraftReply(123, { text: 'Desired' });
+
+    expect(result.action).toBe('created');
+    expect(result.threadId).toBe(22);
+  });
+
+  it('updates the sole active draft on upsert', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Desired')], 1, 1));
+
+    const result = await client.upsertDraftReply(123, { text: 'Desired' });
+
+    expect(result.action).toBe('updated');
+    expect(result.threadId).toBe(11);
+  });
+
+  it('refuses ambiguous upsert when multiple active drafts exist', async () => {
+    fetchMock.mockResolvedValueOnce(paginatedThreads([draftThread(11), draftThread(12)], 1, 1));
+
+    await expect(client.upsertDraftReply(123, { text: 'Desired' })).rejects.toThrow(
+      'Refusing to choose among 2 active draft replies (11, 12)'
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses an explicit thread ID to disambiguate upsert', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(11, 'First'), draftThread(12, 'Second')], 1, 1)
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        paginatedThreads([draftThread(11, 'First'), draftThread(12, 'Desired')], 1, 1)
+      );
+
+    const result = await client.upsertDraftReply(123, { text: 'Desired', threadId: 12 });
+
+    expect(result.threadId).toBe(12);
+    expect(result.action).toBe('updated');
+  });
+
+  it('reports post-write verification failures without claiming success', async () => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1));
+
+    await expect(client.updateDraftReply(123, 11, 'Desired')).rejects.toThrow(
+      'post-write verification failed'
+    );
+  });
+
+  it.each([
+    ['published state', { state: 'published' }],
+    ['non-message type', { type: 'note' }],
+  ])('rejects post-write verification for %s', async (_label, override) => {
+    fetchMock
+      .mockResolvedValueOnce(paginatedThreads([draftThread(11, 'Old')], 1, 1))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        paginatedThreads([{ ...draftThread(11, 'Desired'), ...override }], 1, 1)
+      );
+
+    await expect(client.updateDraftReply(123, 11, 'Desired')).rejects.toThrow(
+      'post-write verification failed'
+    );
   });
 
   it('sends private notes with optional status', async () => {

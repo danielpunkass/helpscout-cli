@@ -1,8 +1,10 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 import { client } from '../lib/api-client.js';
 import { auth } from '../lib/auth.js';
+import { downloadAttachmentToFile } from '../lib/attachment-download.js';
 import { normalizeConversationStatus } from '../lib/conversation-status.js';
 import { buildDateQuery } from '../lib/dates.js';
 import { normalizeSearchQuery } from '../lib/search.js';
@@ -296,8 +298,13 @@ const conversationSchema = z
     folderId: z.number().optional(),
     status: z.string(),
     state: z.string(),
-    subject: z.string(),
-    preview: z.string(),
+    // Help Scout omits empty string fields rather than sending "": a
+    // conversation with no subject (e.g. created from a subject-less email)
+    // has NO `subject` key, and one such conversation fails validation for the
+    // entire result set. `preview` is relaxed with it as the same omit-when-empty
+    // class (a conversation whose first thread has no body).
+    subject: z.string().optional(),
+    preview: z.string().optional(),
     mailboxId: z.number(),
     assignee: personSchema.optional(),
     createdBy: personSchema.optional(),
@@ -503,6 +510,48 @@ const conversationThreadsOutputSchema = z.object({
   filtered_types: z.array(z.string()).optional(),
 });
 
+const draftReplySchema = z.object({
+  threadId: z.number(),
+  conversationId: z.number(),
+  type: z.literal('message'),
+  state: z.literal('draft'),
+  // NOT z.literal('active'): a draft written on a pending/closed conversation carries that
+  // status, and a literal here would fail output validation for the whole result set.
+  status: z.string().optional(),
+  body: z.string(),
+  preview: z.string(),
+  createdAt: z.string(),
+  createdBy: personSchema.optional(),
+  to: z.array(z.string()).optional(),
+  cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional(),
+});
+
+const listDraftRepliesOutputSchema = z.object({
+  conversationId: z.number(),
+  drafts: z.array(draftReplySchema),
+  total: z.number(),
+});
+
+const draftReplyWriteOutputSchema = z.object({
+  success: z.literal(true),
+  conversationId: z.number(),
+  threadId: z.number(),
+  action: z.enum(['created', 'updated']),
+  verified: z.literal(true),
+  draft: draftReplySchema,
+});
+
+const attachmentDownloadOutputSchema = z.object({
+  message: z.literal('Attachment downloaded'),
+  conversationId: z.number(),
+  attachmentId: z.number(),
+  filename: z.string(),
+  path: z.string(),
+  bytes: z.number(),
+  contentType: z.string().optional(),
+});
+
 const searchConversationsOutputSchema = z.object({
   conversations: z.array(conversationSchema),
   total_results: z.number().optional(),
@@ -615,6 +664,13 @@ const DESTRUCTIVE_REMOTE_ANNOTATIONS = {
   openWorldHint: true,
 };
 
+const MUTATING_LOCAL_REMOTE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
 const toolRegistry: Array<{ name: string; description: string }> = [];
 
 type ConversationSummary = JsonObject & {
@@ -664,6 +720,38 @@ export function getServerToolNamesForTesting(): string[] {
 }
 
 /**
+ * The zod output schema of every tool that declares one, read from the same
+ * internal registry. Used by the test that proves relabelling the JSON Schema
+ * dialect (see retargetSchemaDialect) is lossless for the schemas we actually
+ * ship, rather than assuming it.
+ */
+export function getRegisteredOutputSchemasForTesting(): Record<string, unknown> {
+  const internal = server as unknown as {
+    _registeredTools: Record<string, { outputSchema?: unknown }>;
+  };
+  const schemas: Record<string, unknown> = {};
+  for (const [name, tool] of Object.entries(internal._registeredTools)) {
+    if (tool.outputSchema) schemas[name] = tool.outputSchema;
+  }
+  return schemas;
+}
+
+/**
+ * Declared input-param names for one tool, read from the same internal registry.
+ * Used by the test that locks the "declared surface is narrower than what the
+ * client method accepts" defect: a filter the API supports but the tool never
+ * exposes is not a missing feature, it is a silent wrong answer — the caller
+ * asks for a scoped result, cannot express the scope, and gets an unscoped one
+ * reported as success.
+ */
+export function getToolInputKeysForTesting(name: string): string[] {
+  const internal = server as unknown as {
+    _registeredTools: Record<string, { inputSchema?: { shape?: Record<string, unknown> } }>;
+  };
+  return Object.keys(internal._registeredTools[name]?.inputSchema?.shape ?? {});
+}
+
+/**
  * Conversation-returning output schemas, exposed so tests can validate them
  * against realistic Help Scout list/search embed payloads (which omit
  * customFields[].type — see customFieldSchema).
@@ -678,6 +766,11 @@ export const outputSchemasForTesting = {
 /** Exposed for tests guarding the thread output schema against over-strict nesting. */
 export function getThreadSchemaForTesting() {
   return threadSchema;
+}
+
+/** Exposed for tests guarding the MCP draft lifecycle output contract. */
+export function getDraftReplySchemasForTesting() {
+  return { draftReplySchema, listDraftRepliesOutputSchema, draftReplyWriteOutputSchema };
 }
 
 const dateFilterSchema = {
@@ -883,7 +976,7 @@ server.registerTool(
         .describe('Conversation status filter (defaults to "all" to include resolved tickets)'),
       mailbox: z.string().optional().describe('Mailbox ID to filter by'),
       tag: z.string().optional().describe('Tag to filter by'),
-      assignedTo: z.string().optional().describe('User ID assigned to'),
+      assignedTo: z.string().optional().describe('User or team ID assigned to'),
       query: z
         .string()
         .optional()
@@ -1027,15 +1120,53 @@ server.registerTool(
 );
 
 rememberTool(
+  'download_attachment',
+  'Download a conversation attachment from Help Scout to a local file. Fails if the file exists unless force is true.'
+);
+server.registerTool(
+  'download_attachment',
+  {
+    title: 'Download Attachment',
+    description:
+      'Download a conversation attachment from Help Scout to a local file. If outputPath is omitted, saves to the attachment filename in the current working directory. If outputPath is an existing directory or ends with a path separator, saves into that directory using the attachment filename. Fails if the file exists unless force is true.',
+    inputSchema: {
+      conversationId: conversationRefSchema,
+      attachmentId: z.number().int().positive().describe('Help Scout attachment ID'),
+      outputPath: z
+        .string()
+        .optional()
+        .describe(
+          'Optional destination file or directory path. Directories use the attachment filename.'
+        ),
+      force: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('Overwrite the destination file if it already exists'),
+    },
+    outputSchema: attachmentDownloadOutputSchema,
+    annotations: MUTATING_LOCAL_REMOTE_ANNOTATIONS,
+  },
+  async ({ conversationId: conversationRef, attachmentId, outputPath, force = false }) => {
+    const result = await downloadAttachmentToFile(String(conversationRef), String(attachmentId), {
+      output: outputPath,
+      force,
+    });
+
+    return structuredJsonResult({ ...result });
+  }
+);
+
+rememberTool(
   'search_conversations',
-  'Search conversations matching a query. Results are capped by maxResults (default 25). If results are truncated, use date filters or more specific search terms to narrow. WARNING: Compound filters are unreliable — use one filter per call.'
+  'Search conversations matching a query, across all pages. Filter by assignee with assignedTo (a user id, or a team id from list_teams) to fetch everything assigned to someone server-side. Results are capped by maxResults (default 25). If results are truncated, use date filters or more specific search terms to narrow. WARNING: Compound query-string filters are unreliable — use one filter per call.'
 );
 server.registerTool(
   'search_conversations',
   {
     title: 'Search Conversations',
     description:
-      'Search conversations matching a query. Results are capped by maxResults (default 25). If results are truncated, use date filters or more specific search terms to narrow. WARNING: Compound filters are unreliable — use one filter per call.',
+      'Search conversations matching a query, across all result pages. Results are capped by maxResults (default 25). If results are truncated, use date filters or more specific search terms to narrow. assignedTo (a user id, or a team id from list_teams), mailbox, and tag all filter server-side and compose with status — prefer them over encoding the same filter into `query`. WARNING: Compound query-string filters are unreliable — use one filter per call.',
     inputSchema: {
       query: z
         .string()
@@ -1047,6 +1178,17 @@ server.registerTool(
         .enum(['active', 'pending', 'closed', 'spam', 'all'])
         .optional()
         .describe('Status filter (defaults to "all")'),
+      assignedTo: z
+        .string()
+        .optional()
+        .describe(
+          'User or team ID to filter by assignee (server-side, across all pages). Get a user id from list_users, a team id from list_teams — Help Scout assigns to either.'
+        ),
+      mailbox: z
+        .string()
+        .optional()
+        .describe('Mailbox ID to scope the search to (server-side). Get the id from list_mailboxes.'),
+      tag: z.string().optional().describe('Tag name to filter by (server-side).'),
       maxResults: z
         .number()
         .optional()
@@ -1062,6 +1204,9 @@ server.registerTool(
   async ({
     query,
     status = 'all',
+    assignedTo,
+    mailbox,
+    tag,
     maxResults,
     createdSince,
     createdBefore,
@@ -1073,7 +1218,10 @@ server.registerTool(
       { createdSince, createdBefore, modifiedSince, modifiedBefore },
       normalizedQuery
     );
-    const all = await client.listAllConversations({ query: dateQuery, status }, maxResults);
+    const all = await client.listAllConversations(
+      { query: dateQuery, status, assignedTo, mailbox, tag },
+      maxResults
+    );
     return structuredJsonResult(withOmissionMeta(all, maxResults));
   }
 );
@@ -1095,6 +1243,12 @@ server.registerTool(
         .describe('Status filter'),
       mailbox: z.string().optional().describe('Mailbox ID to filter by'),
       tag: z.string().optional().describe('Tag to filter by'),
+      assignedTo: z
+        .string()
+        .optional()
+        .describe(
+          'User or team ID to filter by assignee (server-side). Get a user id from list_users, a team id from list_teams — Help Scout assigns to either.'
+        ),
       maxResults: z
         .number()
         .optional()
@@ -1109,6 +1263,7 @@ server.registerTool(
     status,
     mailbox,
     tag,
+    assignedTo,
     maxResults,
     createdSince,
     createdBefore,
@@ -1122,7 +1277,7 @@ server.registerTool(
       modifiedBefore,
     });
     const conversations = await client.listAllConversations(
-      { status, mailbox, tag, query: dateQuery },
+      { status, mailbox, tag, assignedTo, query: dateQuery },
       maxResults
     );
     return structuredJsonResult(summarizeConversations(conversations));
@@ -1252,13 +1407,17 @@ server.registerTool(
       query: z.string().optional().describe('Search query'),
       firstName: z.string().optional().describe('Filter by first name'),
       lastName: z.string().optional().describe('Filter by last name'),
+      mailbox: z
+        .string()
+        .optional()
+        .describe('Mailbox ID to scope results to. Get the id from list_mailboxes.'),
       page: z.number().optional().describe('Page number'),
     },
     outputSchema: listCustomersOutputSchema,
     annotations: READ_ONLY_REMOTE_ANNOTATIONS,
   },
-  async ({ query, firstName, lastName, page }) => {
-    const result = await client.listCustomers({ query, firstName, lastName, page });
+  async ({ query, firstName, lastName, mailbox, page }) => {
+    const result = await client.listCustomers({ query, firstName, lastName, mailbox, page });
     return structuredJsonResult({
       customers: result.customers.map(cleanCustomer),
       page: result.page,
@@ -1736,6 +1895,27 @@ server.registerTool(
   }
 );
 
+rememberTool(
+  'list_draft_replies',
+  'List active unsent draft replies for a conversation, including thread IDs, body previews, and author metadata.'
+);
+server.registerTool(
+  'list_draft_replies',
+  {
+    title: 'List Draft Replies',
+    description:
+      'List active unsent draft replies for a conversation, including thread IDs, body previews, and author metadata. This tool never sends or changes anything.',
+    inputSchema: { conversationId: conversationRefSchema },
+    outputSchema: listDraftRepliesOutputSchema,
+    annotations: READ_ONLY_REMOTE_ANNOTATIONS,
+  },
+  async ({ conversationId: conversationRef }) => {
+    const conversationId = await client.resolveConversationId(conversationRef);
+    const drafts = await client.listDraftReplies(conversationId);
+    return structuredJsonResult({ conversationId, drafts, total: drafts.length });
+  }
+);
+
 rememberTool('create_reply', 'Send a reply to a conversation (visible to customer)');
 server.registerTool(
   'create_reply',
@@ -1766,24 +1946,79 @@ server.registerTool(
   }
 );
 
-rememberTool('create_draft_reply', 'Create a draft reply on an existing conversation (saves without sending). Use this when responding to an existing ticket — the draft is reviewed and sent from the Help Scout UI. For starting a brand-new outbound conversation, use create_draft_conversation instead.');
+rememberTool('create_draft_reply', 'Create an additional draft reply on an existing conversation and verify its returned thread (saves without sending; the draft is reviewed and sent from the Help Scout UI). Prefer upsert_draft_reply when duplicate drafts are not intended. For starting a brand-new outbound conversation, use create_draft_conversation instead.');
 server.registerTool(
   'create_draft_reply',
   {
     title: 'Create Draft Reply',
     description:
-      'Create a draft reply on an existing conversation (saves without sending). Use this when responding to an existing ticket — the draft is reviewed and sent from the Help Scout UI. For starting a brand-new outbound conversation, use create_draft_conversation instead.',
+      'Create an additional draft reply on an existing conversation and verify its returned Resource-ID thread (saves without sending). Prefer upsert_draft_reply when duplicate drafts are not intended. This tool cannot publish or send.',
     inputSchema: {
       conversationId: conversationRefSchema,
       text: z.string().describe('Draft reply text content (HTML or plain text)'),
     },
-    outputSchema: conversationActionOutputSchema,
+    outputSchema: draftReplyWriteOutputSchema,
     annotations: MUTATING_REMOTE_ANNOTATIONS,
   },
   async ({ conversationId: conversationRef, text }) => {
     const conversationId = await client.resolveConversationId(conversationRef);
-    await client.createDraftReply(conversationId, { text });
-    return structuredJsonResult({ success: true, conversationId });
+    const result = await client.createDraftReply(conversationId, { text });
+    return structuredJsonResult({ success: true, ...result });
+  }
+);
+
+rememberTool(
+  'update_draft_reply',
+  'Update one explicitly identified unsent draft reply in place and verify the final text. Refuses non-draft threads and never sends.'
+);
+server.registerTool(
+  'update_draft_reply',
+  {
+    title: 'Update Draft Reply',
+    description:
+      'Update one explicitly identified unsent draft reply in place and verify the final text. Refuses missing, published, or non-reply threads. This tool cannot publish or send.',
+    inputSchema: {
+      conversationId: conversationRefSchema,
+      threadId: z.number().int().positive().describe('Existing draft reply thread ID'),
+      text: z.string().describe('Replacement draft text (HTML or plain text)'),
+    },
+    outputSchema: draftReplyWriteOutputSchema,
+    annotations: MUTATING_REMOTE_ANNOTATIONS,
+  },
+  async ({ conversationId: conversationRef, threadId, text }) => {
+    const conversationId = await client.resolveConversationId(conversationRef);
+    const result = await client.updateDraftReply(conversationId, threadId, text);
+    return structuredJsonResult({ success: true, ...result });
+  }
+);
+
+rememberTool(
+  'upsert_draft_reply',
+  'Safely update the sole active draft reply or create one when none exists. Refuses multiple drafts unless threadId explicitly selects one; never sends.'
+);
+server.registerTool(
+  'upsert_draft_reply',
+  {
+    title: 'Upsert Draft Reply',
+    description:
+      'Safely update the sole active draft reply or create one when none exists. Refuses to choose among multiple drafts unless threadId explicitly selects one. Verifies the final text and cannot publish or send.',
+    inputSchema: {
+      conversationId: conversationRefSchema,
+      text: z.string().describe('Desired draft text (HTML or plain text)'),
+      threadId: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Explicit draft thread ID, required only to disambiguate multiple drafts'),
+    },
+    outputSchema: draftReplyWriteOutputSchema,
+    annotations: MUTATING_REMOTE_ANNOTATIONS,
+  },
+  async ({ conversationId: conversationRef, text, threadId }) => {
+    const conversationId = await client.resolveConversationId(conversationRef);
+    const result = await client.upsertDraftReply(conversationId, { text, threadId });
+    return structuredJsonResult({ success: true, ...result });
   }
 );
 
@@ -2571,6 +2806,11 @@ server.registerTool(
         .enum(['active', 'pending', 'closed', 'spam', 'all'])
         .optional()
         .describe('Status filter (defaults to "all")'),
+      mailbox: z
+        .string()
+        .optional()
+        .describe('Mailbox ID to scope the search to (server-side). Get the id from list_mailboxes.'),
+      tag: z.string().optional().describe('Tag name to filter by (server-side).'),
       maxResults: z
         .number()
         .optional()
@@ -2584,6 +2824,8 @@ server.registerTool(
   async ({
     email,
     status = 'all',
+    mailbox,
+    tag,
     maxResults,
     createdSince,
     createdBefore,
@@ -2594,7 +2836,12 @@ server.registerTool(
     const dateFilters = { createdSince, createdBefore, modifiedSince, modifiedBefore };
 
     const emailQuery = buildDateQuery(dateFilters, `email:${email}`);
-    const emailSearch = client.listAllConversations({ query: emailQuery, status }, maxResults);
+    // Both legs take the same scope filters — filtering only one would make a
+    // mailbox/tag-scoped search return unscoped domain hits alongside scoped ones.
+    const emailSearch = client.listAllConversations(
+      { query: emailQuery, status, mailbox, tag },
+      maxResults
+    );
 
     const isGenericDomain = GENERIC_EMAIL_DOMAINS.has(domain);
     const domainSearch = isGenericDomain
@@ -2603,6 +2850,8 @@ server.registerTool(
           {
             query: buildDateQuery(dateFilters, `@${domain}`),
             status,
+            mailbox,
+            tag,
           },
           maxResults
         );
@@ -3256,7 +3505,57 @@ for (const tool of DOCS_WRITE_TOOLS) {
   );
 }
 
-export async function runMcpServer() {
-  const transport = new StdioServerTransport();
+/** The only JSON Schema dialect MCP hosts are required to validate against. */
+const JSON_SCHEMA_2020_12 = 'https://json-schema.org/draft/2020-12/schema';
+
+/**
+ * Rewrite the JSON Schema dialect on every schema in a tools/list result.
+ *
+ * The SDK converts our zod schemas without ever passing a target
+ * (`server/mcp.js` calls `toJsonSchemaCompat(obj, { strictUnions, pipeStrategy })`,
+ * and `server/zod-json-schema-compat.js` maps a missing target to `'draft-7'`),
+ * so under zod 4 every schema goes out labelled draft-07. Hosts validate
+ * `outputSchema` with a 2020-12-only validator and reject the *whole tool* at
+ * registration time — not the data — which silently removes all 21 tools that
+ * declare one. `inputSchema` is mislabelled the same way and only survives
+ * because hosts don't currently validate it.
+ *
+ * `registerTool` exposes no target option and rejects pre-built JSON Schema
+ * ("must be a Zod schema or raw shape"), so the dialect cannot be set at the
+ * declaration site; SDK 1.30.0 has the identical defect, so upgrading is not a
+ * fix either. Relabelling is sound because zod emits byte-identical bodies for
+ * both targets across the constructs we use — a property the test suite locks,
+ * so a future schema that would actually convert differently fails loudly
+ * instead of shipping a mislabelled dialect.
+ */
+export function retargetSchemaDialect<T>(message: T): T {
+  const tools = (message as { result?: { tools?: unknown } } | null)?.result?.tools;
+  if (!Array.isArray(tools)) return message;
+
+  for (const tool of tools) {
+    if (!tool || typeof tool !== 'object') continue;
+    for (const key of ['inputSchema', 'outputSchema'] as const) {
+      const schema = (tool as Record<string, unknown>)[key];
+      if (schema && typeof schema === 'object' && '$schema' in schema) {
+        (schema as Record<string, unknown>).$schema = JSON_SCHEMA_2020_12;
+      }
+    }
+  }
+
+  return message;
+}
+
+/**
+ * Connect the server with the dialect fix applied to everything it sends.
+ * Shared by the stdio entry point and the tests, so the tests exercise the
+ * same emission path the MCP host sees rather than a reimplementation of it.
+ */
+export async function connectMcpServer(transport: Transport) {
+  const send = transport.send.bind(transport);
+  transport.send = (message, options) => send(retargetSchemaDialect(message), options);
   await server.connect(transport);
+}
+
+export async function runMcpServer() {
+  await connectMcpServer(new StdioServerTransport());
 }
